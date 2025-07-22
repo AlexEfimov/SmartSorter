@@ -106,7 +106,7 @@ class GUI:
             [sg.Text('Папка с исходными файлами:'), sg.Input(key='src'), sg.FolderBrowse()],
             [sg.Text('Папка для сохранения результатов:'), sg.Input(key='tgt'), sg.FolderBrowse()],
             [sg.Text('LLM-модель:'), sg.Combo(["Загрузка..."], key='model', readonly=True)],
-            [sg.Button('Запуск'), sg.Button('Обновить модели'), sg.Button('Выход')],
+            [sg.Button('Анализ'), sg.Button('Применить сортировку', visible=False, disabled=True, key='-APPLY-'), sg.Button('Обновить модели'), sg.Button('Выход')],
             [sg.ProgressBar(100, orientation='h', size=(40, 15), key='bar', visible=False)],
             [sg.Multiline('', size=(80, 20), key='log', autoscroll=True, disabled=True)]
         ]
@@ -115,6 +115,7 @@ class GUI:
         self.log_elem = self.window['log']
         self.progress = self.window['bar']
         self.ollama_proc = None
+        self.sorting_plan = None
 
     def _load_models(self):
         models, error_msg = get_ollama_models(self._update_log)
@@ -152,7 +153,7 @@ class GUI:
                 self.model_elem.update(values=["Загрузка..."], value="Загрузка...", readonly=True)
                 self._update_log("Обновление списка моделей...")
                 threading.Thread(target=self._load_models, daemon=True).start()
-            if event == 'Запуск':
+            if event == 'Анализ':
                 src, tgt, model = values['src'], values['tgt'], values['model']
                 if not src or not tgt or not model:
                     sg.popup_error("Заполните все поля!")
@@ -165,19 +166,54 @@ class GUI:
                     if proc:
                         self.ollama_proc = proc
 
-                def run_sort():
+                def run_analysis():
                     sorter = SmartSorter(Path(src), Path(tgt), model)
-                    sorter.sort(self.window)
-                    self.window.write_event_value('-DONE-', '')
-                threading.Thread(target=run_sort, daemon=True).start()
+                    self.sorting_plan = sorter.sort(self.window)
+                    self.window.write_event_value('-ANALYSIS_DONE-', '')
+                
+                self.window['-APPLY-'].update(visible=False, disabled=True)
+                threading.Thread(target=run_analysis, daemon=True).start()
                 self.progress.update(0, visible=True)
                 self.log_elem.update("")
 
+            if event == '-ANALYSIS_DONE-':
+                sg.popup_ok("Анализ завершен! Теперь вы можете применить сортировку.")
+                self.window['-APPLY-'].update(visible=True, disabled=False)
+                self.progress.update(0, visible=False)
+
+            if event == '-APPLY-':
+                if not self.sorting_plan:
+                    sg.popup_error("Сначала нужно провести анализ!")
+                    continue
+                
+                self.window['-APPLY-'].update(disabled=True)
+                self.progress.update(0, visible=True)
+                
+                # Нужен новый экземпляр, так как пути могут быть относительными
+                src, tgt, model = values['src'], values['tgt'], values['model']
+                sorter = SmartSorter(Path(src), Path(tgt), model)
+
+                def run_apply():
+                    sorter.apply_sort(self.sorting_plan, self.window)
+                    self.window.write_event_value('-APPLY_DONE-', '')
+
+                threading.Thread(target=run_apply, daemon=True).start()
+
+            if event == '-APPLY_DONE-':
+                sg.popup_ok("Сортировка успешно применена!")
+                self.progress.update(0, visible=False)
+                self.sorting_plan = None
+
+
             if event == '-PROGRESS-':
                 v = values['-PROGRESS-']
-                p = int(v['done'] / v['total'] * 100) if v['total'] else 0
-                self.progress.update(p)
-                self._update_log(v['msg'])
+                # Если пришли данные только для лога, обновляем только его
+                if v['done'] == -1 and v['total'] == -1:
+                    self._update_log(v['msg'])
+                else:
+                    p = int(v['done'] / v['total'] * 100) if v['total'] else 0
+                    self.progress.update(p)
+                    self._update_log(v['msg'])
 
             if event == '-DONE-':
                 sg.popup_ok("Сортировка завершена!")
