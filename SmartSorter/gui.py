@@ -10,7 +10,7 @@ import time
 import json
 
 from smart_sorter.main import SmartSorter
-from smart_sorter.config import DEFAULT_MODEL
+from smart_sorter.config import CATEGORIES, DEFAULT_MODEL
 
 OLLAMA_BIN = "/opt/homebrew/bin/ollama"
 OLLAMA_PORT = 11434
@@ -98,6 +98,80 @@ def save_last_model(name):
     with open(MODEL_CFG, "w", encoding="utf-8") as f:
         json.dump({"last_model": name}, f)
 
+
+def create_preview_window(sorting_plan):
+    """Создает окно предпросмотра и редактирования плана сортировки."""
+    
+    header = ['Файл', 'Категория']
+    original_plan = list(sorting_plan) 
+    category_keys = list(CATEGORIES.keys())
+    
+    table_data = []
+    for src, dst_folder in original_plan:
+        src_path = Path(src)
+        dst_name = Path(dst_folder).name
+        category_key = next((k for k, v in CATEGORIES.items() if v == dst_name), "Прочее")
+        table_data.append([src_path.name, category_key])
+
+    layout = [
+        [sg.Text("План сортировки:", font=("Helvetica", 16))],
+        [sg.Text("Кликните правой кнопкой мыши на файл, чтобы изменить его категорию.")],
+        [sg.Table(values=table_data, headings=header,
+                  auto_size_columns=False, col_widths=[40, 20],
+                  display_row_numbers=True, justification='left',
+                  num_rows=min(15, len(table_data)), key='-TABLE-',
+                  row_height=25, enable_events=True,
+                  right_click_menu=['', category_keys], # Включаем контекстное меню
+                  select_mode=sg.TABLE_SELECT_MODE_BROWSE)],
+        [sg.Button("Применить"), sg.Button("Отмена")]
+    ]
+    
+    window = sg.Window("Предпросмотр и редактирование", layout, modal=True, finalize=True)
+    
+    changed_rows = set()
+
+    while True:
+        event, values = window.read()
+
+        if event in (sg.WINDOW_CLOSED, "Отмена"):
+            final_plan = None
+            break
+        
+        # Проверяем, является ли событие выбором из контекстного меню
+        if event in category_keys:
+            selected_row_indices = values['-TABLE-']
+            if selected_row_indices:
+                selected_row_index = selected_row_indices[0]
+                new_category = event # Событие и есть имя категории
+                
+                # Обновляем данные в таблице
+                table_data[selected_row_index][1] = new_category
+                changed_rows.add(selected_row_index)
+                
+                # Обновляем GUI с подсветкой
+                row_colors = [(i, 'lightblue') for i in changed_rows]
+                window['-TABLE-'].update(values=table_data, row_colors=row_colors)
+            else:
+                # Такое может случиться, если меню было вызвано без выбора строки
+                sg.popup("Не удалось определить выбранную строку. Кликните на строку левой кнопкой мыши, а затем правой.", keep_on_top=True)
+        
+        if event == "Применить":
+            # Конвертируем отредактированные данные обратно в формат плана
+            final_plan = []
+            for i, row in enumerate(table_data):
+                original_src_path, _ = original_plan[i]
+                new_category_key = row[1]
+                new_dst_folder_name = CATEGORIES.get(new_category_key, "Other")
+                # Восстанавливаем полный путь к целевой папке
+                original_tgt_path = Path(original_plan[i][1]).parent
+                new_dst_path = original_tgt_path / new_dst_folder_name
+                final_plan.append((original_src_path, str(new_dst_path)))
+            break
+
+    window.close()
+    return final_plan
+
+
 sg.theme('SystemDefault')
 
 class GUI:
@@ -106,7 +180,7 @@ class GUI:
             [sg.Text('Папка с исходными файлами:'), sg.Input(key='src'), sg.FolderBrowse()],
             [sg.Text('Папка для сохранения результатов:'), sg.Input(key='tgt'), sg.FolderBrowse()],
             [sg.Text('LLM-модель:'), sg.Combo(["Загрузка..."], key='model', readonly=True)],
-            [sg.Button('Анализ'), sg.Button('Применить сортировку', visible=False, disabled=True, key='-APPLY-'), sg.Button('Обновить модели'), sg.Button('Выход')],
+            [sg.Button('Анализ'), sg.Button('Обновить модели'), sg.Button('Выход')],
             [sg.ProgressBar(100, orientation='h', size=(40, 15), key='bar', visible=False)],
             [sg.Multiline('', size=(80, 20), key='log', autoscroll=True, disabled=True)]
         ]
@@ -171,38 +245,35 @@ class GUI:
                     self.sorting_plan = sorter.sort(self.window)
                     self.window.write_event_value('-ANALYSIS_DONE-', '')
                 
-                self.window['-APPLY-'].update(visible=False, disabled=True)
                 threading.Thread(target=run_analysis, daemon=True).start()
                 self.progress.update(0, visible=True)
                 self.log_elem.update("")
 
             if event == '-ANALYSIS_DONE-':
-                sg.popup_ok("Анализ завершен! Теперь вы можете применить сортировку.")
-                self.window['-APPLY-'].update(visible=True, disabled=False)
                 self.progress.update(0, visible=False)
-
-            if event == '-APPLY-':
                 if not self.sorting_plan:
-                    sg.popup_error("Сначала нужно провести анализ!")
+                    sg.popup_error("Анализ не вернул план сортировки. Возможно, не найдено файлов.")
                     continue
-                
-                self.window['-APPLY-'].update(disabled=True)
-                self.progress.update(0, visible=True)
-                
-                # Нужен новый экземпляр, так как пути могут быть относительными
-                src, tgt, model = values['src'], values['tgt'], values['model']
-                sorter = SmartSorter(Path(src), Path(tgt), model)
 
-                def run_apply():
-                    sorter.apply_sort(self.sorting_plan, self.window)
-                    self.window.write_event_value('-APPLY_DONE-', '')
-
-                threading.Thread(target=run_apply, daemon=True).start()
+                # Показываем окно предпросмотра и получаем результат
+                final_plan = create_preview_window(self.sorting_plan)
+                
+                if final_plan:
+                    self._update_log("Применение отсортированного плана...")
+                    # Передаем final_plan в apply_sort
+                    src, tgt, model = values['src'], values['tgt'], values['model']
+                    sorter = SmartSorter(Path(src), Path(tgt), model)
+                    
+                    def run_apply():
+                        sorter.apply_sort(final_plan, self.window)
+                        self.window.write_event_value('-APPLY_DONE-', '')
+                    
+                    threading.Thread(target=run_apply, daemon=True).start()
+                    self.progress.update(0, visible=True)
 
             if event == '-APPLY_DONE-':
                 sg.popup_ok("Сортировка успешно применена!")
                 self.progress.update(0, visible=False)
-                self.sorting_plan = None
 
 
             if event == '-PROGRESS-':

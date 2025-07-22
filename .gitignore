@@ -18,5 +18,8 @@ ollama_log.txt
 # VS Code
 .vscode/
 
+# Other projects
+TG_ClientTrackBot/
+
 # macOS
 .DS_Store 
