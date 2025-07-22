@@ -9,43 +9,73 @@ import signal
 import time
 import json
 
+from smart_sorter.config_manager import load_categories_from_config, save_categories_to_config
+
 from smart_sorter.main import SmartSorter
-from smart_sorter.config import CATEGORIES, DEFAULT_MODEL
+from smart_sorter.config import DEFAULT_MODEL
 
 OLLAMA_BIN = "/opt/homebrew/bin/ollama"
 OLLAMA_PORT = 11434
 OLLAMA_LOG = Path("ollama_log.txt")
 MODEL_CFG = Path("last_llm_model.json")
 
-def is_ollama_running():
-    try:
-        result = subprocess.run(
-            ["lsof", "-Pi", f":{OLLAMA_PORT}", "-sTCP:LISTEN", "-t"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        return result.stdout.strip().splitlines()
-    except Exception:
-        return []
+class OllamaManager:
+    """
+    Manages the lifecycle of the Ollama server process, ensuring that the
+    application only terminates a process that it started itself.
+    """
+    def __init__(self, log_callback):
+        self.log_callback = log_callback
+        self.ollama_proc = None
+        self.did_start_proc = False
 
-def start_ollama(log_callback):
-    """Пытается запустить сервер Ollama, если он еще не запущен."""
-    if not Path(OLLAMA_BIN).exists():
-        log_callback(f"Не удалось запустить Ollama: исполняемый файл не найден по пути {OLLAMA_BIN}")
-        return None
-    if is_ollama_running():
-        # Сервер уже работает, ничего не делаем
-        return None
-    
-    log_callback("Сервер Ollama не запущен. Попытка запуска...")
-    env = os.environ.copy()
-    env["PATH"] += ":/opt/homebrew/bin"
-    try:
-        proc = subprocess.Popen([OLLAMA_BIN, "serve"], preexec_fn=os.setsid, env=env)
-        log_callback("Команда на запуск сервера Ollama отправлена.")
-        return proc
-    except Exception as e:
-        log_callback(f"Ошибка при запуске сервера Ollama: {e}")
-        return None
+    def _is_running(self):
+        try:
+            # Use lsof to check if the port is in a LISTEN state
+            result = subprocess.run(
+                ["lsof", "-Pi", f":{OLLAMA_PORT}", "-sTCP:LISTEN", "-t"],
+                capture_output=True, text=True, timeout=5
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    def ensure_running(self):
+        """Checks if Ollama is running and starts it if necessary."""
+        if self._is_running():
+            self.log_callback("Сервер Ollama уже запущен.")
+            return
+
+        if not Path(OLLAMA_BIN).exists():
+            self.log_callback(f"Не удалось запустить Ollama: исполняемый файл не найден по пути {OLLAMA_BIN}")
+            return
+
+        self.log_callback("Сервер Ollama не запущен. Попытка запуска...")
+        env = os.environ.copy()
+        env["PATH"] += ":/opt/homebrew/bin"
+        try:
+            proc = subprocess.Popen([OLLAMA_BIN, "serve"], preexec_fn=os.setsid, env=env)
+            self.log_callback("Команда на запуск сервера Ollama отправлена. Ожидание 5 секунд...")
+            time.sleep(5)
+            
+            self.ollama_proc = proc
+            self.did_start_proc = True
+            self.log_callback("Сервер Ollama, запущенный приложением, готов.")
+        except Exception as e:
+            self.log_callback(f"Ошибка при запуске сервера Ollama: {e}")
+
+    def shutdown_if_started_by_app(self):
+        """Shuts down the Ollama server ONLY if it was started by this instance."""
+        if self.did_start_proc and self.ollama_proc:
+            self.log_callback("Завершение работы сервера Ollama, запущенного приложением...")
+            try:
+                # Terminate the entire process group
+                os.killpg(os.getpgid(self.ollama_proc.pid), signal.SIGTERM)
+                self.log_callback("Команда на завершение процесса Ollama отправлена.")
+            except ProcessLookupError:
+                self.log_callback("Процесс Ollama уже был завершен ранее.")
+            except Exception as e:
+                self.log_callback(f"Ошибка при завершении процесса Ollama: {e}")
 
 def get_ollama_models(log_callback):
     """
@@ -113,12 +143,69 @@ _EXCLUDED_KEY = "Исключить из сортировки"
 _EXCLUDED_DISPLAY_TEXT = "--- ИСКЛЮЧЕНО ---"
 
 
+def create_category_editor_window():
+    """Создает и управляет окном редактора категорий."""
+    
+    categories = load_categories_from_config()
+    categories_list = list(categories.keys())
+    
+    layout = [
+        [sg.Text("Редактор категорий", font=("Helvetica", 16))],
+        [sg.Listbox(values=categories_list, size=(40, 10), key='-LIST-', enable_events=True)],
+        [sg.Button("Добавить"), sg.Button("Переименовать"), sg.Button("Удалить"), sg.Button("Сохранить и закрыть")]
+    ]
+    
+    window = sg.Window("Редактор категорий", layout, modal=True, finalize=True)
+    
+    while True:
+        event, values = window.read()
+        
+        if event in (sg.WINDOW_CLOSED, "Сохранить и закрыть"):
+            break
+            
+        selected = values['-LIST-'][0] if values['-LIST-'] else None
+
+        if event == "Добавить":
+            name = sg.popup_get_text("Введите название новой категории:", "Добавление категории")
+            if name and name not in categories:
+                folder = sg.popup_get_text(f"Введите имя папки для '{name}':", "Добавление категории", default_text=name.replace(' ', '_'))
+                if folder:
+                    categories[name] = folder
+                    categories_list.append(name)
+                    window['-LIST-'].update(values=categories_list)
+
+        elif event == "Переименовать":
+            if selected:
+                new_name = sg.popup_get_text(f"Введите новое имя для '{selected}':", "Переименование", default_text=selected)
+                if new_name and new_name not in categories:
+                    categories[new_name] = categories.pop(selected)
+                    categories_list = list(categories.keys())
+                    window['-LIST-'].update(values=categories_list)
+            else:
+                sg.popup_error("Сначала выберите категорию для переименования.")
+
+        elif event == "Удалить":
+            if selected:
+                if sg.popup_yes_no(f"Вы уверены, что хотите удалить категорию '{selected}'?") == 'Yes':
+                    del categories[selected]
+                    categories_list.remove(selected)
+                    window['-LIST-'].update(values=categories_list)
+            else:
+                sg.popup_error("Сначала выберите категорию для удаления.")
+                
+    save_categories_to_config(categories)
+    window.close()
+
+
 def create_preview_window(sorting_plan):
     """Создает окно предпросмотра и редактирования плана сортировки с возможностью сортировки и исключения файлов."""
     
+    # Загружаем актуальные категории при каждом открытии окна
+    categories = load_categories_from_config()
+    
     original_plan = list(sorting_plan)
     header = ['Файл', 'Тип', 'Размер', 'Категория']
-    category_keys = list(CATEGORIES.keys())
+    category_keys = list(categories.keys())
     right_click_menu_options = category_keys + ['---', _EXCLUDED_KEY] 
 
     # --- 1. Подготовка данных ---
@@ -127,7 +214,7 @@ def create_preview_window(sorting_plan):
     for i, (src, dst_folder) in enumerate(original_plan):
         src_path = Path(src)
         dst_path = Path(dst_folder)
-        category_key = next((k for k, v in CATEGORIES.items() if v == dst_path.name), "Прочее")
+        category_key = next((k for k, v in categories.items() if v == dst_path.name), "Прочее")
         try:
             file_size_bytes = src_path.stat().st_size if src_path.is_file() else 0
         except (FileNotFoundError, PermissionError):
@@ -241,7 +328,7 @@ def create_preview_window(sorting_plan):
                     continue # Пропускаем исключенные файлы
                 original_idx = item["original_index"]
                 original_src, original_dst = original_plan[original_idx]
-                new_dst_folder_name = CATEGORIES.get(item["category"], "Other")
+                new_dst_folder_name = categories.get(item["category"], "Other")
                 new_dst_path = Path(original_dst).parent / new_dst_folder_name
                 final_plan.append((original_src, str(new_dst_path)))
             break
@@ -258,7 +345,7 @@ class GUI:
             [sg.Text('Папка с исходными файлами:'), sg.Input(key='src'), sg.FolderBrowse()],
             [sg.Text('Папка для сохранения результатов:'), sg.Input(key='tgt'), sg.FolderBrowse()],
             [sg.Text('LLM-модель:'), sg.Combo(["Загрузка..."], key='model', readonly=True)],
-            [sg.Button('Анализ'), sg.Button('Обновить модели'), sg.Button('Выход')],
+            [sg.Button('Анализ'), sg.Button('Обновить модели'), sg.Button("Редактор категорий"), sg.Button('Выход')],
             [sg.ProgressBar(100, orientation='h', size=(40, 15), key='bar', visible=False)],
             [sg.Multiline('', size=(80, 20), key='log', autoscroll=True, disabled=True)]
         ]
@@ -266,7 +353,7 @@ class GUI:
         self.model_elem = self.window['model']
         self.log_elem = self.window['log']
         self.progress = self.window['bar']
-        self.ollama_proc = None
+        self.ollama_manager = OllamaManager(self._update_log)
         self.sorting_plan = None
 
     def _load_models(self):
@@ -283,14 +370,8 @@ class GUI:
 
     def run(self):
         self._update_log("Проверка состояния Ollama...")
-        # Пытаемся запустить сервер Ollama, если он не работает
-        proc = start_ollama(self._update_log)
-        if proc:
-            self.ollama_proc = proc
-            self._update_log("Ожидание готовности сервера (5 секунд)...")
-            time.sleep(5) # Даем серверу время на запуск
-        elif is_ollama_running():
-            self._update_log("Сервер Ollama уже запущен.")
+        # Убеждаемся, что сервер запущен, или запускаем его
+        self.ollama_manager.ensure_running()
 
         threading.Thread(target=self._load_models, daemon=True).start()
 
@@ -305,6 +386,10 @@ class GUI:
                 self.model_elem.update(values=["Загрузка..."], value="Загрузка...", readonly=True)
                 self._update_log("Обновление списка моделей...")
                 threading.Thread(target=self._load_models, daemon=True).start()
+            if event == "Редактор категорий":
+                create_category_editor_window()
+                self._update_log("Редактор категорий закрыт. Настройки применятся при следующем анализе.")
+
             if event == 'Анализ':
                 src, tgt, model = values['src'], values['tgt'], values['model']
                 if not src or not tgt or not model:
@@ -312,11 +397,8 @@ class GUI:
                     continue
                 save_last_model(model)
                 
-                # Проверяем и запускаем Ollama, если это необходимо
-                if not is_ollama_running():
-                    proc = start_ollama(self._update_log)
-                    if proc:
-                        self.ollama_proc = proc
+                # Убеждаемся, что Ollama все еще работает, перед началом анализа
+                self.ollama_manager.ensure_running()
 
                 def run_analysis():
                     sorter = SmartSorter(Path(src), Path(tgt), model)
@@ -368,9 +450,9 @@ class GUI:
                 sg.popup_ok("Сортировка завершена!")
                 self.progress.update(0, visible=False)
 
+        self.ollama_manager.shutdown_if_started_by_app()
         self.window.close()
-        if self.ollama_proc:
-            os.killpg(os.getpgid(self.ollama_proc.pid), signal.SIGTERM)
+
 
 if __name__ == '__main__':
     gui = GUI()
