@@ -99,37 +99,86 @@ def save_last_model(name):
         json.dump({"last_model": name}, f)
 
 
-def create_preview_window(sorting_plan):
-    """Создает окно предпросмотра и редактирования плана сортировки."""
-    
-    header = ['Файл', 'Категория']
-    original_plan = list(sorting_plan) 
-    category_keys = list(CATEGORIES.keys())
-    
-    table_data = []
-    for src, dst_folder in original_plan:
-        src_path = Path(src)
-        dst_name = Path(dst_folder).name
-        category_key = next((k for k, v in CATEGORIES.items() if v == dst_name), "Прочее")
-        table_data.append([src_path.name, category_key])
+def human_readable_size(size, decimal_places=2):
+    """Конвертирует байты в человекочитаемый формат (KB, MB, GB)."""
+    if size is None:
+        return ""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            break
+        size /= 1024.0
+    return f"{size:.{decimal_places}f} {unit}"
 
+_EXCLUDED_KEY = "Исключить из сортировки"
+_EXCLUDED_DISPLAY_TEXT = "--- ИСКЛЮЧЕНО ---"
+
+
+def create_preview_window(sorting_plan):
+    """Создает окно предпросмотра и редактирования плана сортировки с возможностью сортировки и исключения файлов."""
+    
+    original_plan = list(sorting_plan)
+    header = ['Файл', 'Тип', 'Размер', 'Категория']
+    category_keys = list(CATEGORIES.keys())
+    right_click_menu_options = category_keys + ['---', _EXCLUDED_KEY] 
+
+    # --- 1. Подготовка данных ---
+    # `rich_data` - это наш основной источник данных. Все изменения сначала вносятся сюда.
+    rich_data = []
+    for i, (src, dst_folder) in enumerate(original_plan):
+        src_path = Path(src)
+        dst_path = Path(dst_folder)
+        category_key = next((k for k, v in CATEGORIES.items() if v == dst_path.name), "Прочее")
+        try:
+            file_size_bytes = src_path.stat().st_size if src_path.is_file() else 0
+        except (FileNotFoundError, PermissionError):
+            file_size_bytes = 0
+        
+        rich_data.append({
+            "name": src_path.name,
+            "type": src_path.suffix.lower(),
+            "size": file_size_bytes,
+            "category": category_key,
+            "last_known_category": category_key,
+            "original_index": i,
+            "is_excluded": False,
+            "is_changed": False
+        })
+
+    def get_display_data_from_rich(data):
+        """Преобразует `rich_data` в простой список списков для отображения в таблице."""
+        return [[d["name"], d["type"], human_readable_size(d["size"]), d["category"]] for d in data]
+
+    # --- 2. Определение макета окна ---
     layout = [
         [sg.Text("План сортировки:", font=("Helvetica", 16))],
-        [sg.Text("Кликните правой кнопкой мыши на файл, чтобы изменить его категорию.")],
-        [sg.Table(values=table_data, headings=header,
-                  auto_size_columns=False, col_widths=[40, 20],
+        [sg.Text("Кликните на заголовок для сортировки. Кликните правой кнопкой мыши на файл для действий.")],
+        [sg.Table(values=get_display_data_from_rich(rich_data), headings=header,
+                  auto_size_columns=False, col_widths=[40, 10, 15, 20],
                   display_row_numbers=True, justification='left',
-                  num_rows=min(15, len(table_data)), key='-TABLE-',
+                  num_rows=min(20, len(rich_data)), key='-TABLE-',
                   row_height=25, enable_events=True,
-                  right_click_menu=['', category_keys], # Включаем контекстное меню
+                  enable_click_events=True,
+                  right_click_menu=['', right_click_menu_options],
+                  right_click_selects=True,
                   select_mode=sg.TABLE_SELECT_MODE_BROWSE)],
         [sg.Button("Применить"), sg.Button("Отмена")]
     ]
     
     window = sg.Window("Предпросмотр и редактирование", layout, modal=True, finalize=True)
-    
-    changed_rows = set()
+    sort_state = {'col': -1, 'asc': True}
 
+    def update_table_display():
+        """Централизованная функция для обновления таблицы и цветов строк."""
+        display_data = get_display_data_from_rich(rich_data)
+        row_colors = []
+        for i, item in enumerate(rich_data):
+            if item["is_excluded"]:
+                row_colors.append((i, '#cccccc'))  # Серый для исключенных
+            elif item["is_changed"]:
+                row_colors.append((i, 'lightblue')) # Голубой для измененных
+        window['-TABLE-'].update(values=display_data, row_colors=row_colors)
+
+    # --- 3. Основной цикл событий ---
     while True:
         event, values = window.read()
 
@@ -137,35 +186,64 @@ def create_preview_window(sorting_plan):
             final_plan = None
             break
         
-        # Проверяем, является ли событие выбором из контекстного меню
-        if event in category_keys:
-            selected_row_indices = values['-TABLE-']
-            if selected_row_indices:
-                selected_row_index = selected_row_indices[0]
-                new_category = event # Событие и есть имя категории
-                
-                # Обновляем данные в таблице
-                table_data[selected_row_index][1] = new_category
-                changed_rows.add(selected_row_index)
-                
-                # Обновляем GUI с подсветкой
-                row_colors = [(i, 'lightblue') for i in changed_rows]
-                window['-TABLE-'].update(values=table_data, row_colors=row_colors)
-            else:
-                # Такое может случиться, если меню было вызвано без выбора строки
-                sg.popup("Не удалось определить выбранную строку. Кликните на строку левой кнопкой мыши, а затем правой.", keep_on_top=True)
+        # --- Обработка клика по заголовку (Сортировка) ---
+        if isinstance(event, tuple) and event[0] == '-TABLE-' and event[1] == '+CLICKED+':
+            row, col = event[2]
+            if row == -1 and col is not None: 
+                col_name_map = {0: "name", 1: "type", 2: "size", 3: "category"}
+                key_to_sort = col_name_map.get(col)
+                if key_to_sort:
+                    if sort_state['col'] == col:
+                        sort_state['asc'] = not sort_state['asc']
+                    else:
+                        sort_state['col'] = col
+                        sort_state['asc'] = True
+                    
+                    # --- Улучшенная функция для ключа сортировки ---
+                    def sort_key_func(item):
+                        val = item.get(key_to_sort)
+                        # Для строк используем регистронезависимую сортировку
+                        if isinstance(val, str):
+                            return val.lower()
+                        # Для чисел и других типов - оставляем как есть
+                        return val
+
+                    rich_data.sort(key=sort_key_func, reverse=not sort_state['asc'])
+                    update_table_display() # Немедленно обновляем таблицу
         
-        if event == "Применить":
-            # Конвертируем отредактированные данные обратно в формат плана
+        # --- Обработка действий из контекстного меню ---
+        elif event in right_click_menu_options:
+            if values['-TABLE-']:
+                # Индекс `data_idx` теперь всегда правильный, т.к. view и model синхронизированы
+                data_idx = values['-TABLE-'][0]
+                rich_item = rich_data[data_idx]
+                
+                if event == _EXCLUDED_KEY:
+                    rich_item["is_excluded"] = not rich_item["is_excluded"]
+                    if rich_item["is_excluded"]:
+                        rich_item["category"] = _EXCLUDED_DISPLAY_TEXT
+                    else: # Возвращаем последнюю известную категорию
+                        rich_item["category"] = rich_item["last_known_category"]
+
+                elif event in category_keys: # Если выбрана новая категория
+                    rich_item["category"] = event
+                    rich_item["last_known_category"] = event # Запоминаем ее
+                    rich_item["is_excluded"] = False # Снимаем флаг исключения
+                    rich_item["is_changed"] = True   # Помечаем как измененную
+                
+                update_table_display() # Немедленно обновляем таблицу
+
+        # --- Обработка нажатия "Применить" ---
+        elif event == "Применить":
             final_plan = []
-            for i, row in enumerate(table_data):
-                original_src_path, _ = original_plan[i]
-                new_category_key = row[1]
-                new_dst_folder_name = CATEGORIES.get(new_category_key, "Other")
-                # Восстанавливаем полный путь к целевой папке
-                original_tgt_path = Path(original_plan[i][1]).parent
-                new_dst_path = original_tgt_path / new_dst_folder_name
-                final_plan.append((original_src_path, str(new_dst_path)))
+            for item in rich_data:
+                if item["is_excluded"]:
+                    continue # Пропускаем исключенные файлы
+                original_idx = item["original_index"]
+                original_src, original_dst = original_plan[original_idx]
+                new_dst_folder_name = CATEGORIES.get(item["category"], "Other")
+                new_dst_path = Path(original_dst).parent / new_dst_folder_name
+                final_plan.append((original_src, str(new_dst_path)))
             break
 
     window.close()
