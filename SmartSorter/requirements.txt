@@ -1,0 +1,16 @@
+# GUI
+PySimpleGUI>=4.60.0
+
+# Text Extraction
+pdfplumber>=0.10.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+
+# AI & API Communication
+requests>=2.31.0
+
+# Configuration
+PyYAML>=6.0
+python-dotenv>=1.0.0

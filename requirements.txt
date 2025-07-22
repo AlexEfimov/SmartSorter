@@ -1,0 +1,9 @@
+# Основные зависимости
+PySimpleGUI
+python-dotenv
+requests
+pdfplumber
+python-docx
+openpyxl
+Pillow
+pytesseract 
